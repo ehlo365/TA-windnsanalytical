@@ -182,7 +182,10 @@ while(($record = $reader.ReadEvent()) -ne $null) # Do not use Get-WinEvent to av
     $events.Add($record) | Out-Null
 }
 
-$LoggedTimespanSecs = (New-TimeSpan -Start $logStart -End $logEnd).TotalSeconds
+# Added if statement to handle exception: New-TimeSpan : Cannot bind parameter 'Start' to the target. Exception setting "Start": "Cannot convert null to type "System.DateTime".
+if ($logStart) {
+	$LoggedTimespanSecs = (New-TimeSpan -Start $logStart -End $logEnd).TotalSeconds
+}
 
 $swRetrievalTime.Stop()
 $reader.Dispose()
