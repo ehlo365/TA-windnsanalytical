@@ -20,6 +20,14 @@ $eventlogSettings.SaveChanges()
 
 $eventlogSettings
 
+# Modify ETW Trace Provider to only log QUERY_RECEIVED, RECURSE_RESPONSE_IN and RESPONSE_SUCCESS Events.
+try {
+	Set-EtwTraceProvider -Guid '{EB79061A-A566-4698-9119-3ED2807060E7}' -SessionName 'EventLog-Microsoft-Windows-DNSServer-Analytical' -MatchAnyKeyword "0x0000000000000023" -ErrorAction Stop
+}
+catch {
+	#[Console]::Error.WriteLine(("INFO [{0}:{1}] Failed to modify ETW Trace Provider." -f $scriptname, $PID)) 
+}
+
 if($bounce)
 {
     Invoke-Command -Computer $computername -ScriptBlock {
