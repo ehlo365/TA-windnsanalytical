@@ -1,5 +1,15 @@
 # TA-windnsanalytical
-Based on Jake Walter's Windows DNS Analytical Log App (https://splunkbase.splunk.com/app/2937/  - Version 1.0  Oct. 26, 2015  Initial release)
+Forked from Hugh Kelley's archived GitHub repository (https://github.com/hkelley/TA-windnsanalytical) and his Add-On for Windows DNS Analytical Logging (https://splunkbase.splunk.com/app/4300).
+
+Modifications to the originals:
+* Fixed bad regex warning in props.conf
+* Messages was wrapped after 80 characters in Splunk.
+* Data reduction:
+** Modified DNS Analytical ETW Trace provider to log only the required events (reduce number of events to search through).
+
+
+## Original readme
+Based on Jake Walter's Windows DNS Analytical Log App (https://splunkbase.splunk.com/app/2937/  - Version 1.0  Oct. 26, 2015  Initial release).
 
 Subsequent modifications to the original:
 * additional tagging for compatibility with Splunk ES DNS data model
