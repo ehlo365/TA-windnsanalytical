@@ -1,104 +1,156 @@
+<#
+.SYNOPSIS
+    Retrieves DNS analytics from the Windows DNS Server analytical log.
+    This script collects and processes DNS events from the analytical log, applying filters and ignoring specified zones.
 
-param
-(
-      [Parameter(Mandatory = $false)] [int] $MaxRuntimeSecs = 55
-    , [Parameter(Mandatory = $false)] [string] $filterXPath = "*[System[EventID=256 or EventID=257 or EventID=261] and EventData[Data[@Name='InterfaceIP']!='127.0.0.1']]"  # trim noise, log only QUERY_RECEIVED or RECURSE_RESPONSE_IN or RESPONSE_SUCCESS
-    , [Parameter(Mandatory = $false)] [switch] $SplunkdLogging
+.DESCRIPTION
+    This script is designed to facilitate the collection and analysis of DNS events from the Windows DNS Server analytical log. It supports filtering events using XPath expressions and allows ignoring specific DNS zones to reduce noise in the collected data.
+
+.PARAMETER MaxRuntimeSecs
+    Maximum runtime for the script in seconds, after which it will be terminated.
+
+.PARAMETER FilterXPath
+    XPath filter to select specific DNS events from the analytical log. This should be a valid XPath expression and match the events logged in init_dns_analytics.ps1.
+
+.PARAMETER SplunkdLogging
+    Enable logging to splunkd.log.
+#>
+param (
+    [Parameter(Mandatory = $false, HelpMessage="Maximum runtime for the script in seconds, after which it will be terminated.")]
+    [int]$MaxRuntimeSecs = 55,
+    [Parameter(Mandatory = $false, HelpMessage="XPath filter to select specific DNS events from the analytical log. This should be a valid XPath expression and match the events logged in init_dns_analytics.ps1")]
+    [string]$FilterXPath = "*[System[EventID=256 or EventID=257] and EventData[Data[@Name='InterfaceIP']!='127.0.0.1']]",  # trim noise, log only QUERY_RECEIVED and RESPONSE_SUCCESS events
+    [Parameter(Mandatory = $false, HelpMessage="Enable logging to splunkd.log.")]
+    [switch]$SplunkdLogging,
+    [Parameter(Mandatory = $false, HelpMessage="List of DNS zones to ignore.")]
+    [string[]]$IgnoredZones = @("microsoft.com","microsoft.com.akadns.net","sophosxl.net"),
+    [Parameter(Mandatory = $false, HelpMessage="Keyword to match any DNS event.")]
+    [string]$MatchAnyKeyword = "0x0000000000000023"
 )
 
+#---------------------------------------------------------[Initialisations]--------------------------------------------------------
 
+#----------------------------------------------------------[Declarations]----------------------------------------------------------
+$logName = 'Microsoft-Windows-DNSServer/Analytical'
+$scriptname = Split-Path $MyInvocation.MyCommand.Path -Leaf
+
+#-----------------------------------------------------------[Functions]------------------------------------------------------------
 function Start-Watchdog {
-  param(  
-      [Int32]     $WaitSeconds
-    , [ScriptBlock] $Action = {
+    param(  
+        [Int32]$WaitSeconds,
+        [ScriptBlock]$Action = {
             # to splunkd.log
             [Console]::Error.WriteLine(("INFO [{0}:{1}] Script exceeded maximum runtime of {0}.  Terminating PID {1}" -f $WaitSeconds,$PID))
 
             # to index
             [Console]::WriteLine(("INFO [{0}:{1}] Script exceeded maximum runtime of {0}.  Terminating PID {1}" -f $WaitSeconds,$PID))
             Stop-Process -Id $PID 
-       }
-  )
+        }
+    )
   
-  $Wait = "Start-Sleep -seconds $WaitSeconds"
-  $script:Watchdog = [PowerShell]::Create().AddScript($Wait).AddScript($Action)
-  $handle = $Watchdog.BeginInvoke()
-#  Write-Warning "Watchdog will terminate process $PID in $WaitSeconds seconds unless Stop-Watchdog is called."
+    $Wait = "Start-Sleep -seconds $WaitSeconds"
+    $script:Watchdog = [PowerShell]::Create().AddScript($Wait).AddScript($Action)
+    $handle = $Watchdog.BeginInvoke()
+    #  Write-Warning "Watchdog will terminate process $PID in $WaitSeconds seconds unless Stop-Watchdog is called."
 }
 
 function Stop-Watchdog {
-  if ( $script:Watchdog -ne $null) {
-    $script:Watchdog.Stop()
-    $script:Watchdog.Runspace.Close()
-    $script:Watchdog.Dispose()
-    Remove-Variable Watchdog -Scope script
-  } else {
-    Write-Warning 'No Watchdog found.'
-  }
+    if ($null -ne $script:Watchdog) {
+        $script:Watchdog.Stop()
+        $script:Watchdog.Runspace.Close()
+        $script:Watchdog.Dispose()
+        Remove-Variable Watchdog -Scope script
+    } 
+    else {
+        Write-Warning 'No Watchdog found.'
+    }
 }
 
-$scriptname = Split-Path $MyInvocation.MyCommand.Path -Leaf
-
-Start-Watchdog $MaxRuntimeSecs
-if($SplunkdLogging)
-{  [Console]::Error.WriteLine(("INFO [{0}:{1}] Started a watchdog thread to terminate this script if it does not finish within {2}s." -f $scriptname,$PID,$MaxRuntimeSecs))  }
-
-
-$logName = 'Microsoft-Windows-DNSServer/Analytical'
-
-
-$ignoredZonesStatic = @("microsoft.com","microsoft.com.akadns.net","sophosxl.net")
-$ignoredZonesList = New-Object System.Collections.ArrayList
-
-if($SplunkdLogging)
-{  [Console]::Error.WriteLine(("INFO [{0}:{1}] Starting" -f $scriptname,$PID))  }
-
-function BuildRegExPatternFromDomain ([string] $domainBase)
-{
+function BuildRegExPatternFromDomain ([string] $domainBase) {
     return "{0}" -f $domainBase.ToLower().Replace(".","\.")
 }
 
-if($SplunkdLogging)
-{  [Console]::Error.WriteLine(("INFO [{0}:{1}] Collecting local zones" -f $scriptname,$PID))  }
+function Test-IgnoredZone {
+    param(
+        [string]$Qname,
+        [System.Collections.Generic.HashSet[string]]$IgnoredZonesSet
+    )
 
-# build the whitelist/ignore list for records
-foreach($domain in $ignoredZonesStatic)
-{
-    $ignoredZonesList.Add( (BuildRegexPatternFromDomain($domain)))  | Out-Null
+    if ([string]::IsNullOrWhiteSpace($Qname)) {
+        return $false
+    }
+
+    $normalizedQname = $Qname.Trim().TrimEnd('.').ToLowerInvariant()
+    if ($IgnoredZonesSet.Contains($normalizedQname)) {
+        return $true
+    }
+
+    foreach ($ignoredZone in $IgnoredZonesSet) {
+        if ($normalizedQname.EndsWith(".$ignoredZone", [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
 }
-Get-DnsServerZone | %{
+
+#-----------------------------------------------------------[Execution]------------------------------------------------------------
+
+Start-Watchdog $MaxRuntimeSecs
+if($SplunkdLogging) {
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Started a watchdog thread to terminate this script if it does not finish within {2}s." -f $scriptname,$PID,$MaxRuntimeSecs))
+}
+
+$ignoredZonesList = New-Object System.Collections.ArrayList
+
+if($SplunkdLogging) {
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Starting" -f $scriptname,$PID))  
+}
+
+if($SplunkdLogging) {
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Collecting local zones" -f $scriptname,$PID))
+}
+
+# Build the whitelist/ignore list for records
+foreach ($domain in $IgnoredZones) {
+    $ignoredZonesList.Add( (BuildRegexPatternFromDomain($domain))) | Out-Null
+}
+
+Get-DnsServerZone | ForEach-Object{
     $ignoredZonesList.Add( (BuildRegexPatternFromDomain($_.ZoneName))) | Out-Null
 }
 
-# compile a regex to test the zones
-$ignoredZonesRegex = [regex] ("(?i)({0})\.$" -f ($ignoredZonesList -join "|"))
+# compile a fast in-memory lookup for ignored domains
+$ignoredZonesSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($ignoredZone in $ignoredZonesList) {
+    $ignoredZonesSet.Add($ignoredZone.Trim('.').ToLowerInvariant()) | Out-Null
+}
 
-
-if($SplunkdLogging)
-{  [Console]::Error.WriteLine(("INFO [{0}:{1}] Get the Event Log Settings" -f $scriptname,$PID))  }
+if($SplunkdLogging) {
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Get the Event Log Settings" -f $scriptname,$PID))
+}
 
 $eventlogSettings = Get-WinEvent -ListLog $logName
 $prov = Get-WinEvent -ListProvider $eventlogSettings.OwningProviderName 
 $logFilePath = [System.Environment]::ExpandEnvironmentVariables($eventlogSettings.LogFilePath)  # expand the variables in the file path
 $logFile =  Get-ChildItem $logFilePath
 $logBkpPath =  Join-Path -Path $env:TEMP  -ChildPath  ("{0}-PID{1}{2}" -f $logFile.BaseName,$PID,$logFile.Extension) # Generate a unique file path for this proc using the PID
-   #  (Split-Path -Path $logFilePath -Leaf)
+#  (Split-Path -Path $logFilePath -Leaf)
 
-# create sparse arrays to hold mesagetype info.  There are no four-digit event IDs so won't need more than 999 slots
-$messageTypes= new-object pscustomobject[] 999 
+# create a sparse lookup for template metadata.  There are no four-digit event IDs so won't need more than 999 slots
+$messageTypes = @{}
 
 # Ingest the templates and discover the QNAME positions for each
-$NSPREFIX="evt"
+$NSPREFIX = "evt"
 $nsm = $nsMgr = New-Object -TypeName System.Xml.XmlNamespaceManager(New-Object System.Xml.NameTable)
 $nsm.AddNamespace($NSPREFIX,'http://schemas.microsoft.com/win/2004/08/events')
 $filterQnameNode = "/{0}:template/{0}:data[@name='QNAME']" -f $NSPREFIX
 
+if($SplunkdLogging) {
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Begin processing event log message templates" -f $scriptname,$PID))
+}
 
-if($SplunkdLogging)
-{  [Console]::Error.WriteLine(("INFO [{0}:{1}] Begin processing event log message templates" -f $scriptname,$PID))  }
-
-$prov.Events | %{
-    
+$prov.Events | ForEach-Object {
     # Get the message template (human-readable, to-be parsed by Splunk)
     $description = $_.Description -replace ";\s+PacketData=%\d+", ""  # remove packetdata  (for now,  too complicated to parse)
     $description = $description -replace "%(?<token>\d{1,2})", "{`${token}}"   # convert for PS-based tokens
@@ -108,8 +160,7 @@ $prov.Events | %{
 
     $qnameNodePos = $null
     # If the QNAME node exists
-    if($qname = $doc.SelectSingleNode($filterQnameNode,$nsm) )
-    {
+    if ($qname = $doc.SelectSingleNode($filterQnameNode,$nsm) ) {
         # Record the position for later evaluation
         $qnameNodePos = $doc.CreateNavigator().Evaluate( "count($filterQnameNode/preceding-sibling::*)",$nsm)        
     }
@@ -120,9 +171,9 @@ $prov.Events | %{
     }
 }
 
-
-if($SplunkdLogging)
-{  [Console]::Error.WriteLine(("INFO [{0}:{1}] Clone and clear the active log" -f $scriptname,$PID))  }
+if($SplunkdLogging) {
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Clone and clear the active log" -f $scriptname,$PID))
+}
 
 # Clone and clear the active log
 $logSize = $eventlogSettings.Filesize  # before clearing
@@ -130,20 +181,20 @@ $swLogPaused = [Diagnostics.Stopwatch]::StartNew()
 $eventlogSettings.IsEnabled = $false
 $eventlogSettings.SaveChanges()
 Copy-Item $logFilePath -Destination $logBkpPath -Force
-try
-{
+try {
     [System.Diagnostics.Eventing.Reader.EventLogSession]::GlobalSession.ClearLog($eventlogSettings.LogName)
 }
-catch  [System.Management.Automation.MethodException]
-{ # eat this exception.   It says "The process cannot access the file because it is being used by another process" but it lies, the log is cleared    
+catch  [System.Management.Automation.MethodException] { 
+    # Eat this exception. It says "The process cannot access the file because it is being used by another process" but it lies, the log is cleared.
 }
+
 $eventlogSettings.IsEnabled = $true
 $eventlogSettings.SaveChanges()
 $swLogPaused.Stop()
 
 # Modify ETW Trace Provider to only log QUERY_RECEIVED, RECURSE_RESPONSE_IN and RESPONSE_SUCCESS Events. This have to be done after every log restart...
 try {
-	Set-EtwTraceProvider -Guid '{EB79061A-A566-4698-9119-3ED2807060E7}' -SessionName 'EventLog-Microsoft-Windows-DNSServer-Analytical' -MatchAnyKeyword "0x0000000000000023" -ErrorAction Stop
+	Set-EtwTraceProvider -Guid '{EB79061A-A566-4698-9119-3ED2807060E7}' -SessionName 'EventLog-Microsoft-Windows-DNSServer-Analytical' -MatchAnyKeyword $MatchAnyKeyword -ErrorAction Stop
 }
 catch {
 	#[Console]::Error.WriteLine(("INFO [{0}:{1}] Failed to modify ETW Trace Provider." -f $scriptname, $PID)) 
@@ -151,42 +202,44 @@ catch {
 
 # Now process the backed-up log data
 $ignoredRecs=0
+$emittedRecs=0
 $swRetrievalTime = [Diagnostics.Stopwatch]::StartNew()
-$query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($logBkpPath,[System.Diagnostics.Eventing.Reader.PathType]::FilePath , $filterXPath);
+$query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($logBkpPath,[System.Diagnostics.Eventing.Reader.PathType]::FilePath , $FilterXPath);
 
-$reader = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($query)   
-$events = New-Object System.Collections.ArrayList
+$reader = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($query)
 $logStart = $null
 
-if($SplunkdLogging)
+if ($SplunkdLogging)
 {  [Console]::Error.WriteLine(("INFO [{0}:{1}] Process the events." -f $scriptname,$PID))  }
 
-while(($record = $reader.ReadEvent()) -ne $null) # Do not use Get-WinEvent to avoid performance overhead of FormatDescription()
+while ($null -ne ($record = $reader.ReadEvent())) # Do not use Get-WinEvent to avoid performance overhead of FormatDescription()
 {
-    if($logStart -eq $null)
-    {
+    if ($null -eq $logStart) {
         $logStart = $record.TimeCreated
     }
     $logEnd = $record.TimeCreated   # optimize - continuous updating may be inefficient
 
-    # domain of the current record
-    $qname = [string] $record.psbase.Properties[$messageTypes[$record.Id].QNAMEPos].value
-    if($ignoredZonesRegex.IsMatch( $qname.ToLower().Trim()))
-    {
-        $ignoredRecs++
+    $templateInfo = $messageTypes[$record.Id]
+    if ($null -eq $templateInfo) {
         continue
-    }   
-
-    # convert the raw data to a the format, without relying on EventLogRecord.FormatDescription () 
-    $propVals=@($null)
-    foreach($prop in $record.psbase.Properties)
-    {
-        $propVals += $prop.value
     }
 
-    $record | Add-Member -MemberType NoteProperty -Name Message -Value ($messageTypes[$record.Id].Template -f $propVals)
+    # domain of the current record
+    $qname = [string]$record.psbase.Properties[$templateInfo.QNAMEPos].value
+    if (Test-IgnoredZone -Qname $qname -IgnoredZonesSet $ignoredZonesSet) {
+        $ignoredRecs++
+        continue
+    }
 
-    $events.Add($record) | Out-Null
+    # convert the raw data to a the format, without relying on EventLogRecord.FormatDescription () 
+    $propVals = @($null)
+    foreach ($prop in $record.psbase.Properties) {
+        $propVals += [string]$prop.value
+    }
+
+    $record | Add-Member -Force -MemberType NoteProperty -Name Message -Value ($templateInfo.Template -f $propVals)
+    $record | Format-List
+    $emittedRecs++
 }
 
 # Added if statement to handle exception: New-TimeSpan : Cannot bind parameter 'Start' to the target. Exception setting "Start": "Cannot convert null to type "System.DateTime".
@@ -196,40 +249,45 @@ if ($logStart) {
 
 $swRetrievalTime.Stop()
 $reader.Dispose()
-if($LoggedTimespanSecs -eq $null) { $LoggedTimespanSecs = -1 }
+if ($null -eq $LoggedTimespanSecs) { 
+    $LoggedTimespanSecs = -1 
+}
 
-if($SplunkdLogging)
-{  [Console]::Error.WriteLine(("INFO [{0}:{1}] Removing the copy of the log at {2}" -f $scriptname,$PID,$logBkpPath))  }
+if ($SplunkdLogging) {
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Removing the copy of the log at {2}" -f $scriptname,$PID,$logBkpPath))
+}
 
 Remove-Item -Path $logBkpPath
 
 
-if($SplunkdLogging)
-{  [Console]::Error.WriteLine(("INFO [{0}:{1}] Writing the formatted events to STDOUT" -f $scriptname,$PID))  }
-
-# emit for Splunk UF to parse
-$events | fl 
+if ($SplunkdLogging) {
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Writing the formatted events to STDOUT" -f $scriptname,$PID))
+}
 
 # Performance benchmarking only
-#$events[0] | fl TimeCreated
-#$events[-1] | fl TimeCreated
+# The individual records were already emitted above for Splunk parsing.
+# $recordStream[0] | fl TimeCreated
+# $recordStream[-1] | fl TimeCreated
 
 if($SplunkdLogging)
 {  [Console]::Error.WriteLine(("INFO [{0}:{1}] Writing performance data to STDOUT" -f $scriptname,$PID))  }
 
 # Emit some performance stats
 [pscustomobject]@{
-    LogPausedMs=$swLogPaused.ElapsedMilliseconds;
-    DataRetrievalMs=$swRetrievalTime.ElapsedMilliseconds;
-    LogFileMaxBytes=$eventlogSettings.MaximumSizeInBytes
-    LogFileCurBytes=$logSize
-    LoggedRecs=$events.Count
-    IgnoredRecs=$ignoredRecs
-    LogTimespanSecs=$LoggedTimespanSecs
-    ScriptRunSecs=$elapsedTimeSecs = (New-TimeSpan -Start (Get-Process -Id $pid).StartTime  -End (Get-Date)).TotalSeconds  
-}   | fl 
+    LogPausedMs = $swLogPaused.ElapsedMilliseconds;
+    DataRetrievalMs = $swRetrievalTime.ElapsedMilliseconds;
+    LogFileMaxBytes = $eventlogSettings.MaximumSizeInBytes
+    LogFileCurBytes = $logSize
+    LoggedRecs = $emittedRecs
+    IgnoredRecs = $ignoredRecs
+    LogTimespanSecs = $LoggedTimespanSecs
+    ScriptRunSecs = $elapsedTimeSecs = (New-TimeSpan -Start (Get-Process -Id $pid).StartTime  -End (Get-Date)).TotalSeconds  
+} | Format-List 
 
 Stop-Watchdog
 
-if($SplunkdLogging)
-{  [Console]::Error.WriteLine(("INFO [{0}:{1}] Log processing complete and watchdog stopped. Exiting" -f $scriptname,$PID))  }
+if ($SplunkdLogging) {
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Log processing complete and watchdog stopped. Exiting" -f $scriptname,$PID))
+}
+
+#--------------------------------------------------------------[End]---------------------------------------------------------------
