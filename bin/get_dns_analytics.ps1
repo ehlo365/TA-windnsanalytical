@@ -7,7 +7,7 @@
     This script is designed to facilitate the collection and analysis of DNS events from the Windows DNS Server analytical log. It supports filtering events using XPath expressions and allows ignoring specific DNS zones to reduce noise in the collected data.
 
 .PARAMETER MaxRuntimeSecs
-    Maximum runtime for the script in seconds, after which it will be terminated.
+    Maximum runtime for the script in seconds, after which it will be terminated. Default is 55 seconds.
 
 .PARAMETER FilterXPath
     XPath filter to select specific DNS events from the analytical log. This should be a valid XPath expression and match the events logged in init_dns_analytics.ps1.
@@ -25,7 +25,7 @@ param (
     [Parameter(Mandatory = $false, HelpMessage="Enable logging to splunkd.log.")]
     [switch]$SplunkdLogging,
     [Parameter(Mandatory = $false, HelpMessage="List of DNS zones to ignore.")]
-    [string[]]$IgnoredZones = @("microsoft.com","microsoft.com.akadns.net","sophosxl.net"),
+    [string[]]$IgnoredZones = @("microsoft.com", "microsoft.com.akadns.net", "sophosxl.net"),
     [Parameter(Mandatory = $false, HelpMessage="Keyword to match any DNS event.")]
     [string]$MatchAnyKeyword = "0x0000000000000023"
 )
@@ -44,10 +44,10 @@ function Start-Watchdog {
         [Int32]$WaitSeconds,
         [ScriptBlock]$Action = {
             # to splunkd.log
-            [Console]::Error.WriteLine(("INFO [{0}:{1}] Script exceeded maximum runtime of {0}.  Terminating PID {1}" -f $WaitSeconds, $PID))
+            [Console]::Error.WriteLine(("INFO [{0}:{1}] Script exceeded maximum runtime of {0}. Terminating PID {1}" -f $WaitSeconds, $PID))
 
             # to index
-            [Console]::WriteLine(("INFO [{0}:{1}] Script exceeded maximum runtime of {0}.  Terminating PID {1}" -f $WaitSeconds, $PID))
+            [Console]::WriteLine(("INFO [{0}:{1}] Script exceeded maximum runtime of {0}. Terminating PID {1}" -f $WaitSeconds, $PID))
             Stop-Process -Id $PID 
         }
     )
@@ -107,6 +107,19 @@ function Test-IgnoredZone {
     }
 
     return $false
+}
+
+function Write-PlainObject {
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$InputObject
+    )
+
+    $lines = foreach ($property in $InputObject.PSObject.Properties) {
+        "{0} : {1}" -f $property.Name, $property.Value
+    }
+
+    Write-Output ($lines -join [Environment]::NewLine)
 }
 
 function Copy-DnsLog {
@@ -285,7 +298,7 @@ while ($null -ne ($record = $reader.ReadEvent())) # Do not use Get-WinEvent to a
     }
 
     $record | Add-Member -Force -MemberType NoteProperty -Name Message -Value ($templateInfo.Template -f $propVals)
-    $record | Format-List
+    Write-PlainObject -InputObject $record
     $emittedRecs++
 }
 
@@ -320,8 +333,8 @@ if ($SplunkdLogging) {
 if($SplunkdLogging)
 {  [Console]::Error.WriteLine(("INFO [{0}:{1}] Writing performance data to STDOUT" -f $scriptname,$PID))  }
 
-# Emit some performance stats
-[pscustomobject]@{
+# Emit some performance stats as plain text to reduce terminal formatting overhead during testing.
+$stats = [pscustomobject]@{
     LogPausedMs = $logPausedMs
     DataRetrievalMs = $swRetrievalTime.ElapsedMilliseconds
     LogFileMaxBytes = $eventlogSettings.MaximumSizeInBytes
@@ -330,7 +343,8 @@ if($SplunkdLogging)
     IgnoredRecs = $ignoredRecs
     LogTimespanSecs = $LoggedTimespanSecs
     ScriptRunSecs = (New-TimeSpan -Start (Get-Process -Id $pid).StartTime  -End (Get-Date)).TotalSeconds
-} | Format-List
+}
+Write-PlainObject -InputObject $stats
 
 
 # Stop the watchdog timer before exiting the script
