@@ -2,10 +2,37 @@
 Forked from Hugh Kelley's archived GitHub repository (https://github.com/hkelley/TA-windnsanalytical) and his Add-On for Windows DNS Analytical Logging (https://splunkbase.splunk.com/app/4300).
 
 Modifications to the originals:
-* Fixed bad regex warning in props.conf
+* Fixed bad regex warning in `props.conf`
 * Messages was wrapped after 80 characters in Splunk.
-* Data reduction:
-** Modified DNS Analytical ETW Trace provider to log only the required events (reduce number of events to search through).
+* Data reduction to speed up processing:
+  * Modified DNS Analytical ETW Trace provider to log only the required events (reduce number of events to search through).
+
+## Filtering events
+### /bin/init_dns_analytics.ps1
+Events are logged to Analytic log (Microsoft-Windows-DNSServer/Analytical), which is an Event Tracing for Windows (ETV) file that Splunk can't read.
+
+To avoid logging all possible events to the analytical log, calculate the sum of the bitmask values that you actually need to be logged. To see available keywords that can be filtered on, execute the following command:
+```powershell
+logman query providers "Microsoft-Windows-DNSServer"
+```
+
+Examples:
+| Value | Keyword | Analytic Event ID |
+| :--- | :--- | :--- |
+| 0x0000000000000001 | QUERY_RECEIVED | 256 |
+| 0x0000000000000002 | RESPONSE_SUCCESS | 257 |
+| 0x0000000000000020 | RECURSE_RESPONSE_IN | 261 |
+
+To log `QUERY_RECEIVED`, `RESPONSE_SUCCESS` and `RECURSE_RESPONSE_IN` events to the ETW file, specify `0x0000000000000023` in the `$MatchAnyKeyword` parameter.
+
+To log `QUERY_RECEIVED` and `RESPONSE_SUCCESS`, specify `0x0000000000000003` instead.
+
+### /bin/get_dns_analytics.ps1
+In the `$FilterXPath` parameter, specify which Event ID's that should be logged to Splunk. The Event ID's should normally match the keywords specified in `init_dns_analytics.ps1`. By default DNS queries from localhost (127.0.0.1) is excluded in the XPath expression.
+
+Example:
+To fetch `QUERY_RECEIVED`, `RESPONSE_SUCCESS` and `RECURSE_RESPONSE_IN` events, specify Event ID 256, 257 and 261. See [/lookups/win_dns_eventid.csv](/lookups/win_dns_eventid.csv) for additional information.
+
 
 
 ## Original readme
