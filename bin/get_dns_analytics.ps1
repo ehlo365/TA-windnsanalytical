@@ -109,17 +109,20 @@ function Test-IgnoredZone {
     return $false
 }
 
-function Write-PlainObject {
+function Write-SplunkRecord {
     param(
         [Parameter(Mandatory = $true)]
         [psobject]$InputObject
     )
 
-    $lines = foreach ($property in $InputObject.PSObject.Properties) {
-        "{0} : {1}" -f $property.Name, $property.Value
+    $parts = foreach ($property in $InputObject.PSObject.Properties) {
+        $value = [string]$property.Value
+        $value = $value -replace "`r?`n", ' '
+        $value = $value -replace "\s+", ' '
+        "{0} : {1}" -f $property.Name, $value
     }
 
-    Write-Output ($lines -join [Environment]::NewLine)
+    Write-Output ($parts -join '; ')
 }
 
 function Copy-DnsLog {
@@ -298,7 +301,7 @@ while ($null -ne ($record = $reader.ReadEvent())) # Do not use Get-WinEvent to a
     }
 
     $record | Add-Member -Force -MemberType NoteProperty -Name Message -Value ($templateInfo.Template -f $propVals)
-    Write-PlainObject -InputObject $record
+    Write-SplunkRecord -InputObject $record
     $emittedRecs++
 }
 
@@ -333,18 +336,20 @@ if ($SplunkdLogging) {
 if($SplunkdLogging)
 {  [Console]::Error.WriteLine(("INFO [{0}:{1}] Writing performance data to STDOUT" -f $scriptname,$PID))  }
 
-# Emit some performance stats as plain text to reduce terminal formatting overhead during testing.
-$stats = [pscustomobject]@{
-    LogPausedMs = $logPausedMs
-    DataRetrievalMs = $swRetrievalTime.ElapsedMilliseconds
-    LogFileMaxBytes = $eventlogSettings.MaximumSizeInBytes
-    LogFileCurBytes = $logSize
-    LoggedRecs = $emittedRecs
-    IgnoredRecs = $ignoredRecs
-    LogTimespanSecs = $LoggedTimespanSecs
-    ScriptRunSecs = (New-TimeSpan -Start (Get-Process -Id $pid).StartTime  -End (Get-Date)).TotalSeconds
+# Emit performance stats only to stderr when debug logging is enabled; keep stdout reserved for Splunk event data.
+if ($SplunkdLogging) {
+    $stats = [pscustomobject]@{
+        LogPausedMs = $logPausedMs
+        DataRetrievalMs = $swRetrievalTime.ElapsedMilliseconds
+        LogFileMaxBytes = $eventlogSettings.MaximumSizeInBytes
+        LogFileCurBytes = $logSize
+        LoggedRecs = $emittedRecs
+        IgnoredRecs = $ignoredRecs
+        LogTimespanSecs = $LoggedTimespanSecs
+        ScriptRunSecs = (New-TimeSpan -Start (Get-Process -Id $pid).StartTime  -End (Get-Date)).TotalSeconds
+    }
+    Write-Error ("INFO [{0}:{1}] {2}" -f $scriptname, $PID, ((($stats.PSObject.Properties | ForEach-Object { "{0}={1}" -f $_.Name, $_.Value }) -join '; ')))
 }
-Write-PlainObject -InputObject $stats
 
 
 # Stop the watchdog timer before exiting the script
