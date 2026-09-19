@@ -15,6 +15,8 @@
 .PARAMETER SplunkdLogging
     Enable logging to splunkd.log.
 #>
+
+[CmdletBinding()]
 param (
     [Parameter(Mandatory = $false, HelpMessage="Maximum runtime for the script in seconds, after which it will be terminated.")]
     [int]$MaxRuntimeSecs = 55,
@@ -31,8 +33,10 @@ param (
 #---------------------------------------------------------[Initialisations]--------------------------------------------------------
 
 #----------------------------------------------------------[Declarations]----------------------------------------------------------
-$logName = 'Microsoft-Windows-DNSServer/Analytical'
-$scriptname = Split-Path $MyInvocation.MyCommand.Path -Leaf
+[string]$logName = 'Microsoft-Windows-DNSServer/Analytical'
+
+[string]$scriptname = Split-Path $MyInvocation.MyCommand.Path -Leaf
+[System.Collections.ArrayList]$ignoredZonesList = New-Object System.Collections.ArrayList
 
 #-----------------------------------------------------------[Functions]------------------------------------------------------------
 function Start-Watchdog {
@@ -40,21 +44,28 @@ function Start-Watchdog {
         [Int32]$WaitSeconds,
         [ScriptBlock]$Action = {
             # to splunkd.log
-            [Console]::Error.WriteLine(("INFO [{0}:{1}] Script exceeded maximum runtime of {0}.  Terminating PID {1}" -f $WaitSeconds,$PID))
+            [Console]::Error.WriteLine(("INFO [{0}:{1}] Script exceeded maximum runtime of {0}.  Terminating PID {1}" -f $WaitSeconds, $PID))
 
             # to index
-            [Console]::WriteLine(("INFO [{0}:{1}] Script exceeded maximum runtime of {0}.  Terminating PID {1}" -f $WaitSeconds,$PID))
+            [Console]::WriteLine(("INFO [{0}:{1}] Script exceeded maximum runtime of {0}.  Terminating PID {1}" -f $WaitSeconds, $PID))
             Stop-Process -Id $PID 
         }
     )
-  
-    $Wait = "Start-Sleep -seconds $WaitSeconds"
-    $script:Watchdog = [PowerShell]::Create().AddScript($Wait).AddScript($Action)
-    $handle = $Watchdog.BeginInvoke()
-    #  Write-Warning "Watchdog will terminate process $PID in $WaitSeconds seconds unless Stop-Watchdog is called."
+
+    if ($Debug) {
+        $Wait = "Start-Sleep -seconds $WaitSeconds"
+        $script:Watchdog = [PowerShell]::Create().AddScript($Wait).AddScript($Action)
+        $handle = $script:Watchdog.BeginInvoke()
+        #  Write-Warning "Watchdog will terminate process $PID in $WaitSeconds seconds unless Stop-Watchdog is called."
+    }
+    else {
+        [Console]::Error.WriteLine(("INFO [{0}:{1}] Debug mode enabled. Watchdog functionality will be disabled." -f $scriptname, $PID))
+    }
 }
 
 function Stop-Watchdog {
+    param()
+
     if ($null -ne $script:Watchdog) {
         $script:Watchdog.Stop()
         $script:Watchdog.Runspace.Close()
@@ -67,7 +78,11 @@ function Stop-Watchdog {
 }
 
 function BuildRegExPatternFromDomain ([string] $domainBase) {
-    return "{0}" -f $domainBase.ToLower().Replace(".","\.")
+    if ([string]::IsNullOrWhiteSpace($domainBase)) {
+        return [string]::Empty
+    }
+
+    return $domainBase.TrimEnd('.').ToLowerInvariant()
 }
 
 function Test-IgnoredZone {
@@ -94,21 +109,75 @@ function Test-IgnoredZone {
     return $false
 }
 
+function Copy-DnsLog {
+    param(
+        [Parameter(Mandatory=$true, HelpMessage="Specify the source log file path.")]
+        [string]$Source,
+        [Parameter(Mandatory=$true, HelpMessage="Specify the destination log file path.")]
+        [string]$Destination
+    )
+
+    # Start a stopwatch to measure the time the log is paused
+    $swLogPaused = [Diagnostics.Stopwatch]::StartNew()
+
+    # Clone and clear the active log
+    $script:logSize = if ($null -ne $eventlogSettings.Filesize) {
+        $eventlogSettings.Filesize
+    }
+    else {
+        (Get-Item -Path $Source).Length
+    }
+    
+    $script:eventlogSettings.IsEnabled = $false
+    $script:eventlogSettings.SaveChanges()
+
+    # Copy the current log to the backup location
+    Copy-Item $Source -Destination $Destination -Force
+
+    # Important: 
+    # It is not required to clear the log manually, Windows will handle it when the log is disabled and re-enabled
+    # try {
+    #         # Keep the existing logs instead of clearing them
+    #         [System.Diagnostics.Eventing.Reader.EventLogSession]::GlobalSession.ClearLog($eventlogSettings.LogName)
+    # }
+    # catch  [System.Management.Automation.MethodException] { 
+    #     # Eat this exception. It says "The process cannot access the file because it is being used by another process" but it lies, the log is cleared.
+    # }
+
+    # Enable the event log again
+    $script:eventlogSettings.IsEnabled = $true
+    $script:eventlogSettings.SaveChanges()
+
+    # Modify ETW Trace Provider to only log QUERY_RECEIVED, RECURSE_RESPONSE_IN and RESPONSE_SUCCESS Events. This have to be done after every log restart...
+    try {
+        Set-EtwTraceProvider -Guid '{EB79061A-A566-4698-9119-3ED2807060E7}' -SessionName 'EventLog-Microsoft-Windows-DNSServer-Analytical' -MatchAnyKeyword $script:MatchAnyKeyword -ErrorAction Stop
+    }
+    catch {
+        #[Console]::Error.WriteLine(("INFO [{0}:{1}] Failed to modify ETW Trace Provider." -f $scriptname, $PID)) 
+    }
+
+    $swLogPaused.Stop()
+
+    # Return the elapsed time in milliseconds that the log was paused
+    return $swLogPaused.ElapsedMilliseconds
+}
+
+
 #-----------------------------------------------------------[Execution]------------------------------------------------------------
 
+if($SplunkdLogging) {
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Starting" -f $scriptname, $PID))
+}
+
+# Start the watchdog to ensure the script does not run longer than the maximum allowed runtime
 Start-Watchdog $MaxRuntimeSecs
-if($SplunkdLogging) {
-    [Console]::Error.WriteLine(("INFO [{0}:{1}] Started a watchdog thread to terminate this script if it does not finish within {2}s." -f $scriptname,$PID,$MaxRuntimeSecs))
-}
-
-$ignoredZonesList = New-Object System.Collections.ArrayList
 
 if($SplunkdLogging) {
-    [Console]::Error.WriteLine(("INFO [{0}:{1}] Starting" -f $scriptname,$PID))  
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Started a watchdog thread to terminate this script if it does not finish within {2}s." -f $scriptname, $PID, $MaxRuntimeSecs))
 }
 
 if($SplunkdLogging) {
-    [Console]::Error.WriteLine(("INFO [{0}:{1}] Collecting local zones" -f $scriptname,$PID))
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Collecting local DNS zones" -f $scriptname, $PID))
 }
 
 # Build the whitelist/ignore list for records
@@ -131,18 +200,14 @@ if($SplunkdLogging) {
 }
 
 $eventlogSettings = Get-WinEvent -ListLog $logName
-$prov = Get-WinEvent -ListProvider $eventlogSettings.OwningProviderName 
+$prov = Get-WinEvent -ListProvider $eventlogSettings.OwningProviderName
 $logFilePath = [System.Environment]::ExpandEnvironmentVariables($eventlogSettings.LogFilePath)  # expand the variables in the file path
-$logFile =  Get-ChildItem $logFilePath
-$logBkpPath =  Join-Path -Path $env:TEMP  -ChildPath  ("{0}-PID{1}{2}" -f $logFile.BaseName,$PID,$logFile.Extension) # Generate a unique file path for this proc using the PID
-#  (Split-Path -Path $logFilePath -Leaf)
-
-# create a sparse lookup for template metadata.  There are no four-digit event IDs so won't need more than 999 slots
-$messageTypes = @{}
+$logFile = Get-Item -Path $logFilePath
+$logBkpPath = Join-Path -Path $env:TEMP -ChildPath ("{0}-PID{1}{2}" -f $logFile.BaseName, $PID, $logFile.Extension) # Generate a unique file path for this proc using the PID
 
 # Ingest the templates and discover the QNAME positions for each
 $NSPREFIX = "evt"
-$nsm = $nsMgr = New-Object -TypeName System.Xml.XmlNamespaceManager(New-Object System.Xml.NameTable)
+$nsm = New-Object -TypeName System.Xml.XmlNamespaceManager(New-Object System.Xml.NameTable)
 $nsm.AddNamespace($NSPREFIX,'http://schemas.microsoft.com/win/2004/08/events')
 $filterQnameNode = "/{0}:template/{0}:data[@name='QNAME']" -f $NSPREFIX
 
@@ -150,6 +215,10 @@ if($SplunkdLogging) {
     [Console]::Error.WriteLine(("INFO [{0}:{1}] Begin processing event log message templates" -f $scriptname,$PID))
 }
 
+# create a sparse lookup for template metadata. There are no four-digit event IDs so won't need more than 999 slots
+[hashtable]$messageTypes = @{}
+
+# Process each event template to extract the QNAME position and prepare message templates for parsing
 $prov.Events | ForEach-Object {
     # Get the message template (human-readable, to-be parsed by Splunk)
     $description = $_.Description -replace ";\s+PacketData=%\d+", ""  # remove packetdata  (for now,  too complicated to parse)
@@ -165,7 +234,7 @@ $prov.Events | ForEach-Object {
         $qnameNodePos = $doc.CreateNavigator().Evaluate( "count($filterQnameNode/preceding-sibling::*)",$nsm)        
     }
 
-    $messageTypes[$_.Id] = [pscustomobject] @{
+    $messageTypes[[int]$_.Id] = [pscustomobject] @{
         Template = $description
         QNAMEPos = $qnameNodePos
     }
@@ -175,37 +244,14 @@ if($SplunkdLogging) {
     [Console]::Error.WriteLine(("INFO [{0}:{1}] Clone and clear the active log" -f $scriptname,$PID))
 }
 
-# Clone and clear the active log
-$logSize = $eventlogSettings.Filesize  # before clearing
-$swLogPaused = [Diagnostics.Stopwatch]::StartNew()
-$eventlogSettings.IsEnabled = $false
-$eventlogSettings.SaveChanges()
-Copy-Item $logFilePath -Destination $logBkpPath -Force
-try {
-    [System.Diagnostics.Eventing.Reader.EventLogSession]::GlobalSession.ClearLog($eventlogSettings.LogName)
-}
-catch  [System.Management.Automation.MethodException] { 
-    # Eat this exception. It says "The process cannot access the file because it is being used by another process" but it lies, the log is cleared.
-}
-
-$eventlogSettings.IsEnabled = $true
-$eventlogSettings.SaveChanges()
-$swLogPaused.Stop()
-
-# Modify ETW Trace Provider to only log QUERY_RECEIVED, RECURSE_RESPONSE_IN and RESPONSE_SUCCESS Events. This have to be done after every log restart...
-try {
-	Set-EtwTraceProvider -Guid '{EB79061A-A566-4698-9119-3ED2807060E7}' -SessionName 'EventLog-Microsoft-Windows-DNSServer-Analytical' -MatchAnyKeyword $MatchAnyKeyword -ErrorAction Stop
-}
-catch {
-	#[Console]::Error.WriteLine(("INFO [{0}:{1}] Failed to modify ETW Trace Provider." -f $scriptname, $PID)) 
-}
+# Copy the active DNS log to a backup location
+$logPausedMs = Copy-DnsLog -Source $logFilePath -Destination $logBkpPath
 
 # Now process the backed-up log data
-$ignoredRecs=0
-$emittedRecs=0
+$ignoredRecs = 0
+$emittedRecs = 0
 $swRetrievalTime = [Diagnostics.Stopwatch]::StartNew()
-$query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($logBkpPath,[System.Diagnostics.Eventing.Reader.PathType]::FilePath , $FilterXPath);
-
+$query = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery($logBkpPath,[System.Diagnostics.Eventing.Reader.PathType]::FilePath, $FilterXPath);
 $reader = New-Object System.Diagnostics.Eventing.Reader.EventLogReader($query)
 $logStart = $null
 
@@ -219,7 +265,8 @@ while ($null -ne ($record = $reader.ReadEvent())) # Do not use Get-WinEvent to a
     }
     $logEnd = $record.TimeCreated   # optimize - continuous updating may be inefficient
 
-    $templateInfo = $messageTypes[$record.Id]
+    $eventId = [int]$record.Id
+    $templateInfo = $messageTypes[$eventId]
     if ($null -eq $templateInfo) {
         continue
     }
@@ -257,7 +304,8 @@ if ($SplunkdLogging) {
     [Console]::Error.WriteLine(("INFO [{0}:{1}] Removing the copy of the log at {2}" -f $scriptname,$PID,$logBkpPath))
 }
 
-Remove-Item -Path $logBkpPath
+# Delete the backup copy of the log file
+Remove-Item -Path $logBkpPath -Force
 
 
 if ($SplunkdLogging) {
@@ -274,20 +322,22 @@ if($SplunkdLogging)
 
 # Emit some performance stats
 [pscustomobject]@{
-    LogPausedMs = $swLogPaused.ElapsedMilliseconds;
-    DataRetrievalMs = $swRetrievalTime.ElapsedMilliseconds;
+    LogPausedMs = $logPausedMs
+    DataRetrievalMs = $swRetrievalTime.ElapsedMilliseconds
     LogFileMaxBytes = $eventlogSettings.MaximumSizeInBytes
     LogFileCurBytes = $logSize
     LoggedRecs = $emittedRecs
     IgnoredRecs = $ignoredRecs
     LogTimespanSecs = $LoggedTimespanSecs
-    ScriptRunSecs = $elapsedTimeSecs = (New-TimeSpan -Start (Get-Process -Id $pid).StartTime  -End (Get-Date)).TotalSeconds  
-} | Format-List 
+    ScriptRunSecs = (New-TimeSpan -Start (Get-Process -Id $pid).StartTime  -End (Get-Date)).TotalSeconds
+} | Format-List
 
+
+# Stop the watchdog timer before exiting the script
 Stop-Watchdog
 
 if ($SplunkdLogging) {
-    [Console]::Error.WriteLine(("INFO [{0}:{1}] Log processing complete and watchdog stopped. Exiting" -f $scriptname,$PID))
+    [Console]::Error.WriteLine(("INFO [{0}:{1}] Log processing complete and watchdog stopped. Exiting" -f $scriptname, $PID))
 }
 
 #--------------------------------------------------------------[End]---------------------------------------------------------------
